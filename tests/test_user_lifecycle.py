@@ -35,7 +35,7 @@ def admin_auth():
             text("""
                 INSERT INTO users (email, hashed_password, role, is_approved, is_active)
                 VALUES (:email, :pwd, 'admin', TRUE, TRUE)
-                ON DUPLICATE KEY UPDATE role='admin', is_approved=TRUE, is_active=TRUE
+                ON DUPLICATE KEY UPDATE hashed_password=VALUES(hashed_password), role='admin', is_approved=TRUE, is_active=TRUE, is_active=TRUE
             """),
             {"email": admin_email, "pwd": get_password_hash(admin_password)},
         )
