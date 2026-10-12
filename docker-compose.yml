@@ -11,7 +11,7 @@ services:
       DB_HOST: mysql
       DB_PORT: "3306"
     ports:
-      - "8002:8000"
+      - "8006:8000"
     volumes:
       - retail_reports:/app/reports/generated
     depends_on:
