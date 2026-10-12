@@ -1,3 +1,4 @@
+
 pipeline {
     agent any
 
@@ -12,6 +13,7 @@ pipeline {
             steps {
                 checkout scm
                 sh '''
+                    set -eu
                     echo "Repository checked out successfully"
                     git log -1 --oneline
                 '''
@@ -48,184 +50,208 @@ ADMIN_DEFAULT_PASSWORD=${ADMIN_DEFAULT_PASSWORD}
 EOF
 
                         chmod 600 .env
+
                         echo "Environment file created"
+
                         docker compose config -q
+
                         echo "Docker Compose configuration is valid"
                     '''
                 }
             }
         }
 
-        
+        stage('Backend Tests') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'retail-db-password',
+                        variable: 'TEST_DB_PASSWORD'
+                    ),
+                    string(
+                        credentialsId: 'retail-jwt-secret',
+                        variable: 'TEST_JWT_SECRET'
+                    ),
+                    string(
+                        credentialsId: 'retail-admin-password',
+                        variable: 'TEST_ADMIN_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
 
-stage('Backend Tests') {
-    steps {
-        withCredentials([
-            string(credentialsId: 'retail-db-password', variable: 'TEST_DB_PASSWORD'),
-            string(credentialsId: 'retail-jwt-secret', variable: 'TEST_JWT_SECRET'),
-            string(credentialsId: 'retail-admin-password', variable: 'TEST_ADMIN_PASSWORD')
-        ]) {
-            sh '''
-                set -eu
+                        NETWORK="retail-test-${BUILD_NUMBER}"
+                        MYSQL_CONTAINER="retail-test-mysql-${BUILD_NUMBER}"
+                        DATA_VOLUME="retail-data-${BUILD_NUMBER}"
 
-                NETWORK="retail-test-${BUILD_NUMBER}"
-                MYSQL_CONTAINER="retail-test-mysql-${BUILD_NUMBER}"
-                DATA_VOLUME="retail-data-${BUILD_NUMBER}"
-                DATA_LOADER="retail-data-loader-${BUILD_NUMBER}"
-                DATASET_DIR="$WORKSPACE/dataset-download"
-                ARCHIVE="$WORKSPACE/online_retail_ii.zip"
+                        cleanup() {
+                            docker rm -f "$MYSQL_CONTAINER" \
+                                >/dev/null 2>&1 || true
 
-                cleanup() {
-                    docker rm -f "$DATA_LOADER" >/dev/null 2>&1 || true
-                    docker rm -f "$MYSQL_CONTAINER" >/dev/null 2>&1 || true
-                    docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 || true
-                    docker network rm "$NETWORK" >/dev/null 2>&1 || true
-                    rm -rf "$DATASET_DIR" "$ARCHIVE"
+                            docker volume rm "$DATA_VOLUME" \
+                                >/dev/null 2>&1 || true
+
+                            docker network rm "$NETWORK" \
+                                >/dev/null 2>&1 || true
+                        }
+
+                        trap cleanup EXIT
+
+                        echo "Creating temporary test network..."
+
+                        docker network create "$NETWORK"
+
+                        echo "Building backend CI image..."
+
+                        docker build \
+                            -f backend/Dockerfile \
+                            -t retail-analytics-backend:ci .
+
+                        echo "Starting temporary MySQL..."
+
+                        docker run -d \
+                            --name "$MYSQL_CONTAINER" \
+                            --network "$NETWORK" \
+                            --network-alias mysql \
+                            -e MYSQL_ROOT_PASSWORD="$TEST_DB_PASSWORD" \
+                            -e MYSQL_ROOT_HOST='%' \
+                            -e MYSQL_DATABASE=retail_analytics_db \
+                            mysql:8.4
+
+                        echo "Waiting for temporary MySQL database..."
+
+                        READY=0
+
+                        for i in $(seq 1 60); do
+                            if docker exec "$MYSQL_CONTAINER" \
+                                mysqladmin ping \
+                                -h 127.0.0.1 \
+                                -uroot \
+                                "-p${TEST_DB_PASSWORD}" \
+                                --silent >/dev/null 2>&1; then
+                                READY=1
+                                break
+                            fi
+
+                            sleep 3
+                        done
+
+                        if [ "$READY" -ne 1 ]; then
+                            docker logs "$MYSQL_CONTAINER" || true
+                            echo "ERROR: MySQL failed to start"
+                            exit 1
+                        fi
+
+                        echo "Initializing database schema..."
+
+                        docker run --rm \
+                            --network "$NETWORK" \
+                            -e DB_HOST=mysql \
+                            -e DB_PORT=3306 \
+                            -e DB_NAME=retail_analytics_db \
+                            -e DB_USER=root \
+                            -e DB_PASSWORD="$TEST_DB_PASSWORD" \
+                            -e JWT_SECRET_KEY="$TEST_JWT_SECRET" \
+                            -e ADMIN_DEFAULT_PASSWORD="$TEST_ADMIN_PASSWORD" \
+                            --entrypoint python \
+                            retail-analytics-backend:ci \
+                            -m backend.database.init_db
+
+                        echo "Downloading and extracting retail dataset into Docker volume..."
+
+                        docker volume create "$DATA_VOLUME"
+
+                        docker run --rm \
+                            -v "$DATA_VOLUME:/data" \
+                            alpine:3.20 sh -ec '
+                                apk add --no-cache curl unzip
+
+                                curl -fL --retry 3 \
+                                  "https://archive.ics.uci.edu/static/public/502/online+retail+ii.zip" \
+                                  -o /tmp/online_retail_ii.zip
+
+                                unzip -oj /tmp/online_retail_ii.zip \
+                                  -d /data
+
+                                test -s /data/online_retail_II.xlsx
+
+                                echo "Workbook successfully extracted"
+                                ls -lh /data/online_retail_II.xlsx
+                            '
+
+                        echo "Importing retail transactions into temporary MySQL..."
+
+                        docker run --rm \
+                            --network "$NETWORK" \
+                            -v "$DATA_VOLUME:/data:ro" \
+                            -e DB_HOST=mysql \
+                            -e DB_PORT=3306 \
+                            -e DB_NAME=retail_analytics_db \
+                            -e DB_USER=root \
+                            -e DB_PASSWORD="$TEST_DB_PASSWORD" \
+                            -e JWT_SECRET_KEY="$TEST_JWT_SECRET" \
+                            -e ADMIN_DEFAULT_PASSWORD="$TEST_ADMIN_PASSWORD" \
+                            -e DATASET_PATH=/data/online_retail_II.xlsx \
+                            --entrypoint python \
+                            retail-analytics-backend:ci \
+                            -m etl.pipeline --sheet all
+
+                        echo "Verifying imported sales data..."
+
+                        FACT_COUNT="$(
+                            docker exec "$MYSQL_CONTAINER" \
+                                mysql -uroot \
+                                "-p${TEST_DB_PASSWORD}" \
+                                retail_analytics_db \
+                                -N -e "SELECT COUNT(*) FROM fact_sales;"
+                        )"
+
+                        echo "Imported fact_sales rows: $FACT_COUNT"
+
+                        case "$FACT_COUNT" in
+                            ''|*[!0-9]*)
+                                echo "ERROR: Invalid fact_sales row count"
+                                exit 1
+                                ;;
+                        esac
+
+                        if [ "$FACT_COUNT" -le 0 ]; then
+                            echo "ERROR: ETL completed without loading sales records"
+                            exit 1
+                        fi
+
+                        echo "Running backend test suite..."
+
+                        docker run --rm \
+                            --network "$NETWORK" \
+                            -v "$DATA_VOLUME:/data:ro" \
+                            -e DB_HOST=mysql \
+                            -e DB_PORT=3306 \
+                            -e DB_NAME=retail_analytics_db \
+                            -e DB_USER=root \
+                            -e DB_PASSWORD="$TEST_DB_PASSWORD" \
+                            -e JWT_SECRET_KEY="$TEST_JWT_SECRET" \
+                            -e ADMIN_DEFAULT_PASSWORD="$TEST_ADMIN_PASSWORD" \
+                            -e DATASET_PATH=/data/online_retail_II.xlsx \
+                            --entrypoint python \
+                            retail-analytics-backend:ci \
+                            -m pytest tests/ -v --tb=short
+
+                        echo "Backend tests passed"
+                    '''
                 }
-                trap cleanup EXIT
-
-                docker network create "$NETWORK"
-
-                docker build \
-                    -f backend/Dockerfile \
-                    -t retail-analytics-backend:ci .
-
-                docker run -d \
-                    --name "$MYSQL_CONTAINER" \
-                    --network "$NETWORK" \
-                    --network-alias mysql \
-                    -e MYSQL_ROOT_PASSWORD="$TEST_DB_PASSWORD" \
-                    -e MYSQL_ROOT_HOST='%' \
-                    -e MYSQL_DATABASE=retail_analytics_db \
-                    mysql:8.4
-
-                echo "Waiting for temporary MySQL database..."
-                READY=0
-
-                for i in $(seq 1 60); do
-                    if docker exec "$MYSQL_CONTAINER" \
-                        mysqladmin ping -h 127.0.0.1 -uroot \
-                        "-p${TEST_DB_PASSWORD}" --silent >/dev/null 2>&1; then
-                        READY=1
-                        break
-                    fi
-                    sleep 3
-                done
-
-                if [ "$READY" -ne 1 ]; then
-                    docker logs "$MYSQL_CONTAINER" || true
-                    echo "MySQL failed to start"
-                    exit 1
-                fi
-
-                docker run --rm --network "$NETWORK" \
-                    -e DB_HOST=mysql \
-                    -e DB_PORT=3306 \
-                    -e DB_NAME=retail_analytics_db \
-                    -e DB_USER=root \
-                    -e DB_PASSWORD="$TEST_DB_PASSWORD" \
-                    -e JWT_SECRET_KEY="$TEST_JWT_SECRET" \
-                    -e ADMIN_DEFAULT_PASSWORD="$TEST_ADMIN_PASSWORD" \
-                    --entrypoint python \
-                    retail-analytics-backend:ci \
-                    -m backend.database.init_db
-
-                echo "Downloading and extracting retail dataset..."
-
-                mkdir -p "$DATASET_DIR"
-
-                docker run --rm \
-                    -v "$WORKSPACE:/work" \
-                    alpine:3.20 sh -ec '
-                        apk add --no-cache curl unzip
-                        curl -fL --retry 3 \
-                          "https://archive.ics.uci.edu/static/public/502/online+retail+ii.zip" \
-                          -o /work/online_retail_ii.zip
-                        unzip -o /work/online_retail_ii.zip \
-                          -d /work/dataset-download
-                    '
-
-                DATASET_FILE="$(find "$DATASET_DIR" -type f \
-                    -iname 'online_retail_II.xlsx' -print -quit)"
-
-                if [ -z "$DATASET_FILE" ]; then
-                    echo "ERROR: Online Retail II workbook not found"
-                    find "$DATASET_DIR" -type f
-                    exit 1
-                fi
-
-                docker volume create "$DATA_VOLUME"
-
-                docker create --name "$DATA_LOADER" \
-                    -v "$DATA_VOLUME:/data" \
-                    alpine:3.20 sleep 300
-
-                docker cp "$DATASET_FILE" \
-                    "$DATA_LOADER:/data/online_retail_II.xlsx"
-
-                docker rm "$DATA_LOADER"
-
-                echo "Importing retail transactions into temporary MySQL..."
-
-                docker run --rm \
-                    --network "$NETWORK" \
-                    -v "$DATA_VOLUME:/data:ro" \
-                    -e DB_HOST=mysql \
-                    -e DB_PORT=3306 \
-                    -e DB_NAME=retail_analytics_db \
-                    -e DB_USER=root \
-                    -e DB_PASSWORD="$TEST_DB_PASSWORD" \
-                    -e JWT_SECRET_KEY="$TEST_JWT_SECRET" \
-                    -e ADMIN_DEFAULT_PASSWORD="$TEST_ADMIN_PASSWORD" \
-                    -e DATASET_PATH=/data/online_retail_II.xlsx \
-                    --entrypoint python \
-                    retail-analytics-backend:ci \
-                    -m etl.pipeline --sheet all
-
-                echo "Verifying imported sales data..."
-
-                docker exec "$MYSQL_CONTAINER" \
-                    mysql -uroot "-p${TEST_DB_PASSWORD}" \
-                    retail_analytics_db \
-                    -N -e "SELECT COUNT(*) FROM fact_sales;" \
-                    > "$WORKSPACE/fact_sales_count.txt"
-
-                FACT_COUNT="$(cat "$WORKSPACE/fact_sales_count.txt")"
-                echo "Imported fact_sales rows: $FACT_COUNT"
-
-                if [ "$FACT_COUNT" -le 0 ]; then
-                    echo "ERROR: ETL completed without loading sales records"
-                    exit 1
-                fi
-
-                echo "Running backend test suite..."
-
-                docker run --rm \
-                    --network "$NETWORK" \
-                    -v "$DATA_VOLUME:/data:ro" \
-                    -e DB_HOST=mysql \
-                    -e DB_PORT=3306 \
-                    -e DB_NAME=retail_analytics_db \
-                    -e DB_USER=root \
-                    -e DB_PASSWORD="$TEST_DB_PASSWORD" \
-                    -e JWT_SECRET_KEY="$TEST_JWT_SECRET" \
-                    -e ADMIN_DEFAULT_PASSWORD="$TEST_ADMIN_PASSWORD" \
-                    -e DATASET_PATH=/data/online_retail_II.xlsx \
-                    --entrypoint python \
-                    retail-analytics-backend:ci \
-                    -m pytest tests/ -v --tb=short
-            '''
+            }
         }
-    }
-}
-
-
 
         stage('Build Images') {
             steps {
                 sh '''
                     set -eu
+
+                    echo "Building application images..."
+
                     docker compose build
+
                     echo "Docker images built successfully"
                 '''
             }
@@ -235,7 +261,11 @@ stage('Backend Tests') {
             steps {
                 sh '''
                     set -eu
+
+                    echo "Deploying application..."
+
                     docker compose up -d
+
                     docker compose ps
                 '''
             }
@@ -263,13 +293,17 @@ stage('Backend Tests') {
                     done
 
                     if [ "$READY" -ne 1 ]; then
-                        echo "Backend health check failed"
+                        echo "ERROR: Backend health check failed"
+
                         docker compose ps
+
                         docker compose logs --tail=100 backend
+
                         exit 1
                     fi
 
                     echo "Backend health check passed"
+
                     docker compose ps
                 '''
             }
@@ -279,6 +313,7 @@ stage('Backend Tests') {
     post {
         always {
             echo 'Pipeline finished. Displaying container status.'
+
             sh 'docker compose ps || true'
         }
 
